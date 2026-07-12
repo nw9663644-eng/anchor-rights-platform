@@ -1,0 +1,11 @@
+backend/.env
+backend/platform.db
+backend/uploads/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+logs/
+qa-*.png
+__pycache__/
+*.pyc
