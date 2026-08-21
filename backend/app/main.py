@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import time
+from urllib.parse import quote
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.ai_client import ask_ai
-from app.auth import change_password, create_session, get_current_user, init_auth, register_user, require_admin, revoke_session
+from app.auth import LOCKOUT_MINUTES, MAX_LOGIN_ATTEMPTS, LoginLockedError, SESSION_HOURS, change_password, create_session, get_current_user, get_session_token, init_auth, register_user, require_admin, revoke_session
 from app.data.content import CASES, QUESTIONS
 from app.data.knowledge_seed import LEGAL_KNOWLEDGE
 from app.evaluator import RIGHTS_PACKAGES, evaluate_answers
+from app.security import decrypt_evidence, encrypt_evidence, evidence_encryption_ready, file_signature_allowed, redact_sensitive_text, sha256_bytes
 from app.storage import (
     delete_case, delete_evidence, delete_knowledge, delete_matter, evaluation_owned, get_evidence, init_db, list_audit_logs, list_cases, list_evaluations,
-    list_knowledge, list_matters, log_action, matter_owned, platform_stats, save_case, save_evaluation,
-    save_evidence, save_knowledge, save_matter, update_matter,
+    list_knowledge, list_matters, list_reviews, log_action, matter_owned, platform_stats, request_human_review, save_case, save_evaluation,
+    save_evidence, save_knowledge, save_matter, update_matter, update_review,
 )
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
@@ -26,12 +31,14 @@ ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".webp",
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 AI_RATE_LIMIT = 20
 _ai_calls: dict[str, list[float]] = {}
-_login_attempts: dict[str, list[float]] = {}
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class AuthRequest(BaseModel):
     email: str
     password: str = Field(min_length=8, max_length=128)
+    portal: Literal["admin", "user"] | None = None
 
 
 class RegisterRequest(AuthRequest):
@@ -91,12 +98,43 @@ class MatterUpdateRequest(BaseModel):
     current_step: int = Field(default=1, ge=1, le=4)
 
 
-app = FastAPI(title="Anchor Rights Platform API", version="0.2.0")
+class ReviewCreateRequest(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+class ReviewUpdateRequest(BaseModel):
+    status: str
+    comment: str = Field(default="", max_length=5000)
+
+
+app = FastAPI(
+    title="Anchor Rights Platform API",
+    version="0.4.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+)(:\d+)?|https://[a-z0-9-]+\.trycloudflare\.com",
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    if request.url.path.startswith(("/api/auth", "/api/evidence", "/api/ai", "/api/reviews")):
+        response.headers["Cache-Control"] = "no-store"
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    if scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 
 @app.on_event("startup")
@@ -108,30 +146,40 @@ def startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.4.0"}
+
+
+def _session_response(response: Response, data: dict) -> dict:
+    token = data.pop("token")
+    response.set_cookie(
+        key="anchor_session", value=token, httponly=True, secure=COOKIE_SECURE,
+        samesite="strict", max_age=SESSION_HOURS * 3600, path="/",
+    )
+    return data
 
 
 @app.post("/api/auth/register")
-def register(payload: RegisterRequest) -> dict:
+def register(payload: RegisterRequest, response: Response) -> dict:
     try:
-        return register_user(payload.email, payload.name, payload.password)
+        data = register_user(payload.email, payload.name, payload.password)
+        log_action(data["user"]["id"], "注册并登录", "security", data["user"]["id"], "新账号已创建")
+        return _session_response(response, data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/auth/login")
-def login(payload: AuthRequest) -> dict:
-    key = payload.email.strip().lower()
-    now = time.time()
-    attempts = [stamp for stamp in _login_attempts.get(key, []) if now - stamp < 900]
-    if len(attempts) >= 10:
-        raise HTTPException(status_code=429, detail="登录尝试过多，请 15 分钟后再试。")
+def login(payload: AuthRequest, response: Response) -> dict:
+    fingerprint = hashlib.sha256(payload.email.strip().lower().encode("utf-8")).hexdigest()[:12]
     try:
-        result = create_session(payload.email, payload.password)
-        _login_attempts.pop(key, None)
-        return result
+        data = create_session(payload.email, payload.password, payload.portal)
+        log_action(data["user"]["id"], "登录成功", "security", data["user"]["id"], "会话已签发")
+        return _session_response(response, data)
+    except LoginLockedError as exc:
+        log_action("anonymous", "账号锁定", "security", fingerprint, "连续登录失败触发临时锁定")
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except ValueError as exc:
-        attempts.append(now); _login_attempts[key] = attempts
+        log_action("anonymous", "登录失败", "security", fingerprint, "凭据校验失败")
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
@@ -141,18 +189,23 @@ def me(user: dict = Depends(get_current_user)) -> dict:
 
 
 @app.post("/api/auth/logout")
-def logout(authorization: str | None = Header(default=None), _: dict = Depends(get_current_user)) -> dict:
-    if authorization:
-        revoke_session(authorization.removeprefix("Bearer "))
+def logout(request: Request, response: Response, authorization: str | None = Header(default=None), user: dict = Depends(get_current_user)) -> dict:
+    token = get_session_token(authorization, request.cookies.get("anchor_session"))
+    if token:
+        revoke_session(token)
+    response.delete_cookie("anchor_session", path="/", secure=COOKIE_SECURE, samesite="strict")
+    log_action(user["id"], "退出登录", "security", user["id"], "会话已撤销")
     return {"loggedOut": True}
 
 
 @app.post("/api/auth/change-password")
-def update_password(payload: PasswordChangeRequest, user: dict = Depends(get_current_user)) -> dict:
+def update_password(payload: PasswordChangeRequest, response: Response, user: dict = Depends(get_current_user)) -> dict:
     try:
         change_password(user["id"], payload.current_password, payload.new_password)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.delete_cookie("anchor_session", path="/", secure=COOKIE_SECURE, samesite="strict")
+    log_action(user["id"], "修改密码", "security", user["id"], "全部旧会话已撤销")
     return {"changed": True, "requiresLogin": True}
 
 
@@ -182,6 +235,29 @@ def evaluate(payload: EvaluationRequest, user: dict = Depends(get_current_user))
 @app.get("/api/evaluations")
 def evaluations(limit: int = 20, user: dict = Depends(get_current_user)) -> dict:
     return {"items": list_evaluations(user["id"], min(max(limit, 1), 100), user["role"] == "admin")}
+
+
+@app.get("/api/reviews")
+def reviews(user: dict = Depends(get_current_user)) -> dict:
+    return {"items": list_reviews(user["id"], user["role"] == "admin")}
+
+
+@app.post("/api/evaluations/{evaluation_id}/reviews")
+def create_review_request(evaluation_id: str, payload: ReviewCreateRequest, user: dict = Depends(get_current_user)) -> dict:
+    if not evaluation_owned(evaluation_id, user["id"], user["role"] == "admin"):
+        raise HTTPException(status_code=404, detail="评估报告不存在或无权访问。")
+    item = request_human_review(evaluation_id, user["id"], payload.note)
+    log_action(user["id"], "申请人工复核", "review", item["id"], item["status"])
+    return {"item": item}
+
+
+@app.patch("/api/admin/reviews/{review_id}")
+def patch_review(review_id: str, payload: ReviewUpdateRequest, user: dict = Depends(require_admin)) -> dict:
+    item = update_review(review_id, user["id"], payload.status, payload.comment)
+    if not item:
+        raise HTTPException(status_code=400, detail="复核记录不存在或状态无效。")
+    log_action(user["id"], "更新人工复核", "review", review_id, payload.status)
+    return {"item": item}
 
 
 @app.get("/api/matters")
@@ -232,12 +308,15 @@ async def upload_evidence(
     content = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="单个文件不能超过 15MB。")
+    if not content or not file_signature_allowed(safe_name, content):
+        raise HTTPException(status_code=415, detail="文件内容与扩展名不一致或格式不受支持。")
     user_dir = UPLOAD_DIR / user["id"]
     user_dir.mkdir(parents=True, exist_ok=True)
     stored_name = f"{uuid4().hex}{extension}"
-    (user_dir / stored_name).write_bytes(content)
-    item = save_evidence(matter_id, {"name": safe_name, "category": category[:80], "note": note[:1000], "status": "已上传", "stored_name": f"{user['id']}/{stored_name}", "mime_type": file.content_type or "application/octet-stream", "size_bytes": len(content)})
-    log_action(user["id"], "上传证据", "evidence", item["id"], safe_name)
+    digest = sha256_bytes(content)
+    (user_dir / stored_name).write_bytes(encrypt_evidence(content))
+    item = save_evidence(matter_id, {"name": safe_name, "category": category[:80], "note": note[:1000], "status": "已加密存档", "stored_name": f"{user['id']}/{stored_name}", "mime_type": file.content_type or "application/octet-stream", "size_bytes": len(content), "sha256": digest, "encrypted": True})
+    log_action(user["id"], "加密上传证据", "evidence", item["id"], f"{safe_name} / SHA256 {digest[:12]}")
     return {"item": item}
 
 
@@ -249,7 +328,20 @@ def download_evidence(evidence_id: str, user: dict = Depends(get_current_user)):
     path = (UPLOAD_DIR / item["storedName"]).resolve()
     if not path.is_file() or UPLOAD_DIR.resolve() not in path.parents:
         raise HTTPException(status_code=404, detail="文件不存在。")
-    return FileResponse(path, media_type=item["mimeType"], filename=item["name"])
+    content = path.read_bytes()
+    if item["encrypted"]:
+        try:
+            content = decrypt_evidence(content)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if item["sha256"] and sha256_bytes(content) != item["sha256"]:
+        raise HTTPException(status_code=409, detail="证据文件完整性校验失败。")
+    log_action(user["id"], "下载证据", "evidence", evidence_id, item["name"])
+    return Response(
+        content=content,
+        media_type=item["mimeType"] or "application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(item['name'])}", "Cache-Control": "no-store"},
+    )
 
 
 @app.delete("/api/evidence/{evidence_id}")
@@ -306,14 +398,36 @@ def remove_legal_knowledge(knowledge_id: str, user: dict = Depends(require_admin
     return {"deleted": True}
 
 
-@app.get("/api/admin/stats")
-def admin_stats(user: dict = Depends(get_current_user)) -> dict:
+@app.get("/api/dashboard/stats")
+def dashboard_stats(user: dict = Depends(get_current_user)) -> dict:
     return platform_stats(user["id"], user["role"] == "admin")
+
+
+@app.get("/api/admin/stats")
+def admin_stats(user: dict = Depends(require_admin)) -> dict:
+    return platform_stats(user["id"], True)
 
 
 @app.get("/api/admin/audit-logs")
 def audit_logs(limit: int = 100, _: dict = Depends(require_admin)) -> dict:
     return {"items": list_audit_logs(limit)}
+
+
+@app.get("/api/security/status")
+def security_status(request: Request, _: dict = Depends(get_current_user)) -> dict:
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    return {
+        "https": scheme == "https",
+        "httpOnlySession": True,
+        "secureCookie": COOKIE_SECURE,
+        "loginLockout": {"enabled": True, "attempts": MAX_LOGIN_ATTEMPTS, "minutes": LOCKOUT_MINUTES},
+        "evidenceEncryption": evidence_encryption_ready(),
+        "evidenceIntegrity": "SHA-256",
+        "aiAutoRedaction": True,
+        "aiLocalStorage": False,
+        "auditLogging": True,
+        "manualReview": True,
+    }
 
 
 @app.post("/api/ai/chat")
@@ -323,13 +437,40 @@ def ai_chat(payload: AiChatRequest, user: dict = Depends(get_current_user)) -> d
     if len(recent) >= AI_RATE_LIMIT:
         raise HTTPException(status_code=429, detail="AI 问答每小时最多 20 次，请稍后再试。")
     recent.append(now); _ai_calls[user["id"]] = recent
-    messages = [{"role": item.role, "content": item.content.strip()} for item in payload.messages if item.role in {"user", "assistant"}][-12:]
+    messages = []
+    redacted_count = 0
+    for item in payload.messages:
+        if item.role not in {"user", "assistant"}:
+            continue
+        cleaned, count = redact_sensitive_text(item.content.strip())
+        redacted_count += count
+        messages.append({"role": item.role, "content": cleaned})
+    messages = messages[-12:]
     if not messages:
         raise HTTPException(status_code=400, detail="请输入问题。")
     try:
         query = messages[-1]["content"]
         knowledge = list_knowledge(query[:100]) or list_knowledge()[:6]
         context = "\n".join(f"- {item['title']}：{item['summary']}；依据：{'；'.join(item['basis'][:3])}" for item in knowledge[:6])
-        return {"answer": ask_ai(messages, context)}
+        answer = ask_ai(messages, context)
+        log_action(user["id"], "使用 AI 助手", "ai", str(uuid4()), f"自动脱敏 {redacted_count} 处；未保存对话正文")
+        return {"answer": answer, "privacy": {"redactedCount": redacted_count, "storedLocally": False, "transportEncrypted": True}}
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail="AI 服务暂时不可用，请稍后重试。") from exc
+
+
+# Serve the built React application from the API process in production. This
+# keeps the small Windows deployment single-process and same-origin.
+FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", Path(__file__).resolve().parents[2] / "frontend" / "dist"))
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
+
+if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").is_file():
+    @app.get("/{frontend_path:path}", include_in_schema=False)
+    def frontend(frontend_path: str):
+        if frontend_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found.")
+        requested = (FRONTEND_DIST / frontend_path).resolve()
+        if requested.is_relative_to(FRONTEND_DIST.resolve()) and requested.is_file():
+            return FileResponse(requested)
+        return FileResponse(FRONTEND_DIST / "index.html")

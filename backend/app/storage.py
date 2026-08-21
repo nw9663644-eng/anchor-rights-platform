@@ -147,12 +147,22 @@ def init_db(initial_cases: list[dict] | None = None, initial_knowledge: list[dic
                 detail TEXT NOT NULL, created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_requests (
+                id TEXT PRIMARY KEY, evaluation_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                status TEXT NOT NULL, request_note TEXT NOT NULL,
+                reviewer_id TEXT, reviewer_comment TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+            )
+        """)
         _ensure_column(conn, "evaluations", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
         _ensure_column(conn, "matters", "user_id", "TEXT NOT NULL DEFAULT 'legacy'")
         _ensure_column(conn, "matters", "evaluation_id", "TEXT")
         _ensure_column(conn, "evidence_items", "stored_name", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "evidence_items", "mime_type", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "evidence_items", "size_bytes", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "evidence_items", "sha256", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "evidence_items", "encrypted", "INTEGER NOT NULL DEFAULT 0")
         if initial_cases:
             count = _row_value(conn.execute("SELECT COUNT(*) AS total FROM cases").fetchone(), "total")
             if count == 0:
@@ -491,7 +501,7 @@ def list_matters(user_id: str, is_admin: bool = False) -> list[dict]:
     by_matter: dict[str, list] = {}
     for row in evidence:
         if row["matter_id"] in ids:
-            by_matter.setdefault(row["matter_id"], []).append({"id": row["id"], "category": row["category"], "name": row["name"], "status": row["status"], "note": row["note"], "storedName": row["stored_name"], "mimeType": row["mime_type"], "sizeBytes": row["size_bytes"]})
+            by_matter.setdefault(row["matter_id"], []).append({"id": row["id"], "category": row["category"], "name": row["name"], "status": row["status"], "note": row["note"], "storedName": row["stored_name"], "mimeType": row["mime_type"], "sizeBytes": row["size_bytes"], "sha256": row["sha256"], "encrypted": bool(row["encrypted"])})
     return [{"id": row["id"], "title": row["title"], "partyRole": row["party_role"], "mcnName": row["mcn_name"], "disputeTypes": json.loads(row["dispute_types_json"]), "status": row["status"], "currentStep": row["current_step"], "evaluationId": row["evaluation_id"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "evidence": by_matter.get(row["id"], [])} for row in matters]
 
 
@@ -527,9 +537,9 @@ def delete_matter(matter_id: str, user_id: str, is_admin: bool = False) -> list[
 
 def save_evidence(matter_id: str, payload: dict) -> dict:
     now = _now()
-    item = {"id": str(uuid4()), "category": payload.get("category", "其他材料"), "name": payload["name"].strip(), "status": payload.get("status", "待核验"), "note": payload.get("note", "").strip(), "storedName": payload.get("stored_name", ""), "mimeType": payload.get("mime_type", ""), "sizeBytes": int(payload.get("size_bytes", 0))}
+    item = {"id": str(uuid4()), "category": payload.get("category", "其他材料"), "name": payload["name"].strip(), "status": payload.get("status", "待核验"), "note": payload.get("note", "").strip(), "storedName": payload.get("stored_name", ""), "mimeType": payload.get("mime_type", ""), "sizeBytes": int(payload.get("size_bytes", 0)), "sha256": payload.get("sha256", ""), "encrypted": bool(payload.get("encrypted", False))}
     with _connect() as conn:
-        conn.execute(_param("INSERT INTO evidence_items (id,matter_id,category,name,status,note,created_at,updated_at,stored_name,mime_type,size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?)"), (item["id"], matter_id, item["category"], item["name"], item["status"], item["note"], now, now, item["storedName"], item["mimeType"], item["sizeBytes"]))
+        conn.execute(_param("INSERT INTO evidence_items (id,matter_id,category,name,status,note,created_at,updated_at,stored_name,mime_type,size_bytes,sha256,encrypted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"), (item["id"], matter_id, item["category"], item["name"], item["status"], item["note"], now, now, item["storedName"], item["mimeType"], item["sizeBytes"], item["sha256"], int(item["encrypted"])))
         conn.commit()
     return item
 
@@ -540,7 +550,7 @@ def get_evidence(evidence_id: str, user_id: str, is_admin: bool = False) -> dict
         row = conn.execute(_param(sql), (evidence_id,)).fetchone()
     if not row or (not is_admin and row["user_id"] != user_id):
         return None
-    return {"id": row["id"], "matterId": row["matter_id"], "name": row["name"], "storedName": row["stored_name"], "mimeType": row["mime_type"], "sizeBytes": row["size_bytes"]}
+    return {"id": row["id"], "matterId": row["matter_id"], "name": row["name"], "storedName": row["stored_name"], "mimeType": row["mime_type"], "sizeBytes": row["size_bytes"], "sha256": row["sha256"], "encrypted": bool(row["encrypted"])}
 
 
 def delete_evidence(evidence_id: str, user_id: str, is_admin: bool = False) -> dict | None:
@@ -563,6 +573,83 @@ def list_audit_logs(limit: int = 100) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(_param("""SELECT a.*, COALESCE(u.name,'历史用户') AS user_name, COALESCE(u.email,'') AS user_email FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT ?"""), (min(max(limit, 1), 500),)).fetchall()
     return [{"id": row["id"], "userName": row["user_name"], "userEmail": row["user_email"], "action": row["action"], "entityType": row["entity_type"], "entityId": row["entity_id"], "detail": row["detail"], "createdAt": row["created_at"]} for row in rows]
+
+
+def request_human_review(evaluation_id: str, user_id: str, note: str = "") -> dict:
+    now = _now()
+    with _connect() as conn:
+        existing = conn.execute(
+            _param("SELECT * FROM review_requests WHERE evaluation_id=? AND user_id=? ORDER BY created_at DESC LIMIT 1"),
+            (evaluation_id, user_id),
+        ).fetchone()
+        if existing and existing["status"] in {"待复核", "复核中", "需补充材料"}:
+            return _review_row(existing)
+        review_id = str(uuid4())
+        conn.execute(
+            _param("INSERT INTO review_requests (id,evaluation_id,user_id,status,request_note,reviewer_id,reviewer_comment,created_at,updated_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)"),
+            (review_id, evaluation_id, user_id, "待复核", note.strip()[:2000], None, "", now, now, None),
+        )
+        conn.commit()
+    return get_review(review_id, user_id, False) or {}
+
+
+def _review_row(row: Any) -> dict:
+    item = {
+        "id": row["id"], "evaluationId": row["evaluation_id"], "userId": row["user_id"],
+        "status": row["status"], "requestNote": row["request_note"],
+        "reviewerId": row["reviewer_id"], "reviewerComment": row["reviewer_comment"],
+        "createdAt": row["created_at"], "updatedAt": row["updated_at"], "completedAt": row["completed_at"],
+    }
+    keys = set(row.keys())
+    if "user_name" in keys:
+        item["userName"] = row["user_name"]
+        item["userEmail"] = row["user_email"]
+    if "reviewer_name" in keys:
+        item["reviewerName"] = row["reviewer_name"] or ""
+    if "result_json" in keys:
+        item["result"] = json.loads(row["result_json"])
+    return item
+
+
+def get_review(review_id: str, user_id: str, is_admin: bool = False) -> dict | None:
+    with _connect() as conn:
+        if is_admin:
+            row = conn.execute(_param("SELECT * FROM review_requests WHERE id=?"), (review_id,)).fetchone()
+        else:
+            row = conn.execute(_param("SELECT * FROM review_requests WHERE id=? AND user_id=?"), (review_id, user_id)).fetchone()
+    return _review_row(row) if row else None
+
+
+def list_reviews(user_id: str, is_admin: bool = False) -> list[dict]:
+    with _connect() as conn:
+        base = """SELECT r.*, e.result_json, u.name AS user_name, u.email AS user_email,
+                  reviewer.name AS reviewer_name
+                  FROM review_requests r
+                  JOIN evaluations e ON e.id=r.evaluation_id
+                  LEFT JOIN users u ON u.id=r.user_id
+                  LEFT JOIN users reviewer ON reviewer.id=r.reviewer_id"""
+        if is_admin:
+            rows = conn.execute(base + " ORDER BY CASE r.status WHEN '待复核' THEN 0 WHEN '复核中' THEN 1 WHEN '需补充材料' THEN 2 ELSE 3 END, r.updated_at DESC").fetchall()
+        else:
+            rows = conn.execute(_param(base + " WHERE r.user_id=? ORDER BY r.updated_at DESC"), (user_id,)).fetchall()
+    return [_review_row(row) for row in rows]
+
+
+def update_review(review_id: str, reviewer_id: str, status: str, comment: str) -> dict | None:
+    allowed = {"复核中", "需补充材料", "已完成"}
+    if status not in allowed:
+        return None
+    now = _now()
+    completed_at = now if status == "已完成" else None
+    with _connect() as conn:
+        cursor = conn.execute(
+            _param("UPDATE review_requests SET status=?, reviewer_id=?, reviewer_comment=?, updated_at=?, completed_at=? WHERE id=?"),
+            (status, reviewer_id, comment.strip()[:5000], now, completed_at, review_id),
+        )
+        conn.commit()
+    if cursor.rowcount == 0:
+        return None
+    return get_review(review_id, reviewer_id, True)
 
 
 def delete_knowledge(knowledge_id: str) -> bool:
