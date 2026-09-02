@@ -36,6 +36,8 @@ SYSTEM_PROMPT = """你是“网络主播与 MCN 机构用工关系评估及权�
 def ask_ai(messages: list[dict], knowledge_context: str = "") -> str:
     if not AI_API_KEY:
         raise RuntimeError("AI API key is not configured.")
+    if not AI_BASE_URL.startswith("https://"):
+        raise RuntimeError("AI API must use HTTPS.")
 
     payload = {
         "model": AI_MODEL,

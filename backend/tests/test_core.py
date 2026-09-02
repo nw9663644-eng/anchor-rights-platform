@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app import auth, storage
+from app import auth, security, storage
 from app.data.content import QUESTIONS
 from app.evaluator import evaluate_answers
 
@@ -15,6 +15,7 @@ class PlatformCoreTests(unittest.TestCase):
         storage.USE_POSTGRES = False
         storage.init_db([], [])
         auth.init_auth()
+        security.KEY_PATH = Path(self.temp.name) / ".data_key"
 
     def tearDown(self):
         self.temp.cleanup()
@@ -52,6 +53,49 @@ class PlatformCoreTests(unittest.TestCase):
         logs = storage.list_audit_logs()
         self.assertEqual(logs[0]["action"], "新建事项")
         self.assertEqual(logs[0]["userName"], "审计用户")
+
+    def test_login_is_locked_after_repeated_failures(self):
+        auth.register_user("locked@example.com", "锁定测试", "Password123!")
+        for _ in range(auth.MAX_LOGIN_ATTEMPTS - 1):
+            with self.assertRaises(ValueError):
+                auth.create_session("locked@example.com", "wrong-password")
+        with self.assertRaises(auth.LoginLockedError):
+            auth.create_session("locked@example.com", "wrong-password")
+        with self.assertRaises(auth.LoginLockedError):
+            auth.create_session("locked@example.com", "Password123!")
+
+    def test_admin_account_and_portal_role_are_enforced(self):
+        admin = auth.create_session("admin12", "2026lhzp", "admin")["user"]
+        self.assertEqual(admin["role"], "admin")
+        user = auth.register_user("portal-user@example.com", "普通用户", "Password123!")["user"]
+        self.assertEqual(user["role"], "user")
+        with self.assertRaises(ValueError):
+            auth.create_session("portal-user@example.com", "Password123!", "admin")
+        with self.assertRaises(ValueError):
+            auth.create_session("admin12", "2026lhzp", "user")
+
+    def test_ai_redaction_and_evidence_encryption(self):
+        text = "手机号13800138000，身份证11010519491231002X，邮箱demo@example.com"
+        redacted, count = security.redact_sensitive_text(text)
+        self.assertEqual(count, 3)
+        self.assertNotIn("13800138000", redacted)
+        content = b"important evidence"
+        encrypted = security.encrypt_evidence(content)
+        self.assertNotEqual(content, encrypted)
+        self.assertEqual(security.decrypt_evidence(encrypted), content)
+
+    def test_human_review_is_isolated_and_traceable(self):
+        first = auth.register_user("reviewer-target@example.com", "申请人", "Password123!")["user"]
+        second = auth.register_user("other-review@example.com", "其他用户", "Password123!")["user"]
+        storage.save_evaluation({}, {"totalScore": 82, "relationType": "labor", "relationLabel": "标准劳动关系", "gaps": []}, first["id"])
+        evaluation_id = storage.list_evaluations(first["id"])[0]["id"]
+        review = storage.request_human_review(evaluation_id, first["id"], "请核对计分")
+        self.assertEqual(review["status"], "待复核")
+        self.assertEqual(len(storage.list_reviews(first["id"])), 1)
+        self.assertEqual(len(storage.list_reviews(second["id"])), 0)
+        completed = storage.update_review(review["id"], second["id"], "已完成", "已核对问卷与计分")
+        self.assertEqual(completed["status"], "已完成")
+        self.assertEqual(completed["reviewerComment"], "已核对问卷与计分")
 
 
 if __name__ == "__main__":

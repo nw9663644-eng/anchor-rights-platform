@@ -1,7 +1,9 @@
 backend/.env
+backend/.data_key
 backend/platform.db
 backend/uploads/
 backend/.venv/
+backend/.testdeps/
 frontend/node_modules/
 frontend/dist/
 frontend/tsconfig.tsbuildinfo
