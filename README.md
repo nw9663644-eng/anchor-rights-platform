@@ -36,6 +36,27 @@ node serve-public-demo.mjs
 
 临时公网演示可运行 `D:\legal\anchor-rights-platform\start-public-demo.ps1`。该链接依赖本机和网络持续在线，不等于正式部署。
 
+## Windows 云服务器部署
+
+先构建前端，再以管理员身份运行部署脚本：
+
+```powershell
+cd D:\legal\anchor-rights-platform\frontend
+npm ci
+npm run build
+
+cd ..
+.\deploy\windows-deploy.ps1
+```
+
+部署脚本会注册平台启动任务、两分钟健康检查守护任务和每日数据库备份。若要直接通过公网 IP 启用可信 HTTPS，请先将 `lego.exe` 放到服务器的 `C:\anchor-rights-platform\https-tools`，在云平台和 Windows 防火墙放通 TCP 443，然后运行：
+
+```powershell
+.\deploy\windows-https.ps1 -PublicIp "服务器公网IP"
+```
+
+HTTPS 脚本会申请短期 IP 证书、注册 443 服务并每两天自动更新证书。证书、私钥、数据库、上传材料和 `.env` 均不得提交到 GitHub。
+
 ## 管理员
 
 首次启动会读取 `backend/.env` 中的 `ADMIN_EMAIL` 和 `ADMIN_PASSWORD`。未配置时仅用于本地初始化的默认账号为 `admin@anchor-rights.local`，默认密码必须在公开使用前更换。
@@ -74,6 +95,6 @@ npm run build
 ## 上线前仍需完成
 
 - 更换管理员密码和已使用的 AI 密钥
-- 使用 PostgreSQL、对象存储、HTTPS 正式域名和定时备份
+- 正式运营时使用 PostgreSQL、对象存储和已备案域名，并验证异地备份恢复流程
 - 补充隐私政策、用户协议、数据删除与 AI 敏感信息提示
 - 增加法规内容版本管理、AI 权威引用和更完整的端到端测试

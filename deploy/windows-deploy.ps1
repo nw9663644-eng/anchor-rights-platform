@@ -74,9 +74,17 @@ if (-not (Test-Path $venvPython)) {
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $BackendRoot "requirements.txt")
 
 Write-Step "Registering automatic startup and recovery"
+$runScriptPath = Join-Path $InstallRoot "run-platform.ps1"
+$runScript = @'
+$ErrorActionPreference = "Continue"
+Set-Location "C:\anchor-rights-platform\backend"
+& "C:\anchor-rights-platform\.venv\Scripts\python.exe" -m uvicorn app.main:app --host 0.0.0.0 --port 80 --workers 1 *>> "C:\anchor-rights-platform\logs\platform.log"
+'@
+Set-Content -Path $runScriptPath -Value $runScript -Encoding UTF8
+
 $action = New-ScheduledTaskAction `
-    -Execute $venvPython `
-    -Argument "-m uvicorn app.main:app --host 0.0.0.0 --port 80 --workers 1" `
+    -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runScriptPath`"" `
     -WorkingDirectory $BackendRoot
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet `
@@ -85,6 +93,27 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -StartWhenAvailable
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+
+$watchdogScriptPath = Join-Path $InstallRoot "watchdog.ps1"
+$watchdogScript = @'
+$healthy = $false
+try {
+    $health = Invoke-RestMethod "http://127.0.0.1/api/health" -TimeoutSec 8
+    $healthy = $health.status -eq "ok"
+} catch {}
+
+if (-not $healthy) {
+    Stop-ScheduledTask -TaskName "AnchorRightsPlatform" -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process |
+        Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*anchor-rights-platform*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+    Start-ScheduledTask -TaskName "AnchorRightsPlatform"
+}
+'@
+Set-Content -Path $watchdogScriptPath -Value $watchdogScript -Encoding UTF8
+& schtasks.exe /Create /TN "AnchorRightsWatchdog" /SC MINUTE /MO 2 `
+    /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $watchdogScriptPath" /RU SYSTEM /F | Out-Null
 
 if (-not (Get-NetFirewallRule -DisplayName "Anchor Rights Platform HTTP" -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName "Anchor Rights Platform HTTP" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow | Out-Null
@@ -106,7 +135,10 @@ $backupAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-No
 $backupTrigger = New-ScheduledTaskTrigger -Daily -At 3am
 Register-ScheduledTask -TaskName "AnchorRightsDatabaseBackup" -Action $backupAction -Trigger $backupTrigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $venvPython } | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*anchor-rights-platform*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Step "Verifying the public service"
